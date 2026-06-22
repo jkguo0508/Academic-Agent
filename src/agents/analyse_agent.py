@@ -1,0 +1,217 @@
+import sys
+import os
+
+current_dir = os.path.dirname(os.path.abspath(__file__))  # 获取当前文件所在目录（agents目录）
+src_parent_dir = os.path.dirname(os.path.dirname(current_dir))  # 向上两级找到 Paper-Agents 目录
+
+# 将路径添加到 Python 搜索路径
+sys.path.append(src_parent_dir)
+
+
+from typing import Any, Dict, List, Optional, Union, AsyncGenerator, Sequence,get_type_hints,TypeAlias
+from autogen_agentchat.agents import BaseChatAgent
+import asyncio
+
+from starlette.routing import Route
+from src.utils.log_utils import setup_logger
+from src.utils.tool_utils import handlerChunk
+from src.agents.reading_agent import ExtractedPapersData,KeyMethodology,ExtractedPaperData
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, TextMessage,StructuredMessage
+from autogen_agentchat.base import Response
+from autogen_core import CancellationToken, RoutedAgent
+from src.agents.sub_analyse_agent.cluster_agent import PaperClusterAgent
+from src.agents.sub_analyse_agent.deep_analyse_agent import DeepAnalyseAgent
+from src.agents.sub_analyse_agent.global_analyse_agent import GlobalanalyseAgent
+from src.core.model_client import create_default_client
+from src.core.state_models import BackToFrontData, AnalysisResults
+from src.utils.concurrency import gather_in_batches, run_with_retry
+import json
+
+from src.core.state_models import State,ExecutionState
+from autogen_core import message_handler
+
+logger = setup_logger(__name__)
+# BaseChatAgent
+class AnalyseAgent(BaseChatAgent):
+    """基于AutoGen框架的论文分析智能体"""
+    
+    def __init__(self, name: str = "analyse_agent", state_queue: asyncio.Queue = None):
+        super().__init__(name, "A simple agent that counts down.")
+        """初始化论文分析系列智能体"""
+        # 创建聚类智能体
+        self.cluster_agent = PaperClusterAgent()
+        # 创建深度分析智能体
+        self.deep_analyse_agent = DeepAnalyseAgent()
+        # 创建全局分析智能体
+        self.global_analyse_agent = GlobalanalyseAgent()
+    
+        self.model_client = create_default_client()
+        self.state_queue = state_queue
+        # 结构化分析结果(AnalysisResults)，由 analyse_node 读取
+        self.analysis_result = None
+    
+    @property
+    def produced_message_types(self) -> Sequence[type[BaseChatMessage]]:
+        return (TextMessage,)
+
+    # @message_handler
+    async def on_messages(self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken) -> Response:
+        """处理分析消息并返回响应
+        
+        Args:
+            message: 提取的论文数据
+            cancellation_token: 取消令牌
+            
+        Returns:
+            Response: 包含分析结果的响应对象
+        """
+        # Calls the on_messages_stream.
+        response: Response | None = None
+        stream_message = messages[-1].content
+        # async for msg in self.on_messages_stream(stream_message, cancellation_token):
+        #     if isinstance(msg, Response):
+        #         response = msg
+        response = await self.on_messages_stream(stream_message, cancellation_token)
+        assert response is not None
+        return response
+
+    # @message_handler
+    async def on_messages_stream(self, message: ExtractedPapersData, cancellation_token: CancellationToken) -> Any:
+        """流式处理分析消息
+        
+        Args:
+            message: 提取的论文数据
+            cancellation_token: 取消令牌
+            
+        Yields:
+            生成分析过程中的事件或消息
+            AsyncGenerator[BaseAgentEvent | BaseChatMessage | Response, None]
+        """
+        # 1. 调用聚类智能体进行论文聚类
+        await self.state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="thinking",data="正在进行论文聚类分析\n"))
+        cluster_results = await self.cluster_agent.run(message)
+        await self.state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="thinking",data=f"论文聚类分析完成，共形成 {len(cluster_results)} 个聚类\n"))
+
+        # 2. 调用深度分析智能体分析每个聚类的论文
+        deep_analysis_results = []
+        await self.state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="thinking",data="正在进行论文深度分析\n"))
+        # 并发治理：信号量限流 + 分批 + 重试
+        deep_analysis_results = await gather_in_batches(
+            [(lambda c=cluster: run_with_retry(lambda: self.deep_analyse_agent.run(c))) for cluster in cluster_results],
+            return_exceptions=False,
+        )
+        await self.state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="thinking",data="论文深度分析完成\n"))
+        
+        # 3. 调用全局分析智能体生成整体分析报告
+        await self.state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="thinking",data="等待全局分析\n"))
+        global_analysis = {}
+        is_thinking = None
+        async for chunk in self.global_analyse_agent.run(deep_analysis_results):
+            if isinstance(chunk, Dict):
+                if not chunk.get("isSuccess", False):
+                    await self.state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="error",data=chunk.get("global_analyse", "Unknown error")))
+                    break
+                global_analysis = chunk
+                break
+            state,is_thinking = handlerChunk(is_thinking,chunk)
+            if state is None:
+                continue
+            await self.state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state=state,data=chunk))
+
+        # 构建结构化分析结果(AnalysisResults)，供写作层基于结构而非字符串使用
+        if not isinstance(global_analysis, dict):
+            global_analysis = {}
+        global_text = global_analysis.get("global_analyse", "") or ""
+        self.analysis_result = self._build_analysis_results(deep_analysis_results, global_text)
+
+        return Response(
+            chat_message=TextMessage(
+                content=global_text,
+                 source=self.name
+            )
+        )
+
+    def _build_analysis_results(self, deep_analysis_results, global_text: str) -> AnalysisResults:
+        """从深度分析结果与全局叙述文本构建结构化 AnalysisResults。"""
+        topic_clusters: Dict[str, List[str]] = {}
+        method_comparison: List[Dict[str, Any]] = []
+        cluster_themes: List[str] = []
+        for r in deep_analysis_results or []:
+            theme = getattr(r, "theme", None) or "未命名主题"
+            cluster_themes.append(theme)
+            labels: List[str] = []
+            for p in (getattr(r, "papers", None) or []):
+                if not isinstance(p, dict):
+                    continue
+                core_problem = (p.get("core_problem") or "").strip()
+                labels.append(core_problem[:60] if core_problem else "paper")
+                km = p.get("key_methodology") or {}
+                if isinstance(km, dict) and km.get("name"):
+                    method_comparison.append({
+                        "theme": theme,
+                        "method": km.get("name"),
+                        "principle": km.get("principle"),
+                        "novelty": km.get("novelty"),
+                    })
+            topic_clusters[theme] = labels
+        return AnalysisResults(
+            topic_clusters=topic_clusters or None,
+            method_comparison=method_comparison or None,
+            cluster_themes=cluster_themes or None,
+            global_summary=global_text or None,
+        )
+
+    async def on_reset(self, cancellation_token: CancellationToken) -> None:
+        pass
+   
+async def analyse_node(state: State) -> State:
+    """搜索论文节点"""
+    try:
+        state_queue = state["state_queue"]
+        current_state = state["value"]
+        current_state.current_step = ExecutionState.ANALYZING
+        await state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="initializing",data=None))
+        extracted_papers = current_state.extracted_data
+
+        analyse_agent = AnalyseAgent(state_queue=state_queue)
+        task = StructuredMessage(content=extracted_papers, source="User")
+        # task = TextMessage(content=json.dumps(extracted_papers.model_dump(),ensure_ascii=False), source="User")
+        response = await analyse_agent.run(task=task)
+
+        # 分析结果改为结构化对象 AnalysisResults（而非 JSON 字符串）
+        analysis = analyse_agent.analysis_result
+        if analysis is None:
+            content = response.messages[-1].content if response and response.messages else ""
+            analysis = AnalysisResults(global_summary=content or None)
+        current_state.analyse_results = analysis
+
+        # 仅将全局叙述文本发送给前端展示，避免杂乱的 JSON
+        display_content = analysis.global_summary or ""
+        await state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="completed",data=display_content))
+
+        return {"value": current_state}
+            
+    except Exception as e:
+        err_msg = f"Analyse failed: {str(e)}"
+        state["value"].error.analyse_node_error = err_msg
+        await state_queue.put(BackToFrontData(step=ExecutionState.ANALYZING,state="error",data=err_msg))
+        return state
+
+def main():
+    """主函数"""
+    asyncio.run(analyse_node(state))
+
+if __name__ == "__main__":
+    pass
+    # from src.core.state_models import PaperAgentState,NodeError
+    # state_queue = asyncio.Queue()
+    # initial_state = PaperAgentState(
+    #         user_request="帮我写一篇关于人工智能的调研报告",
+    #         max_papers=2,
+    #         error=NodeError(),
+    #         config={}  # 可以传入各种配置
+    #     )
+    # state = {"state_queue": state_queue, "value": initial_state}
+    # analyse_agent = AnalyseAgent()
+    # main()
